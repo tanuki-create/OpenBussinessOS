@@ -1,0 +1,19 @@
+{
+  "id": "business_map_generation",
+  "name": "Business Map Generation",
+  "version": "0.1.0",
+  "stage": "business_map",
+  "llm_task": "business_map_generation",
+  "budget_mode": "cheap",
+  "inputs": { "required": ["project.one_liner"], "optional": ["answers", "engineering_state"] },
+  "questions": [
+    {
+      "id": "success_horizon",
+      "text": "2週間後に何が分かれば前進ですか？",
+      "reason": "施策を作業ではなく検証にするためです。",
+      "input_type": "short_text"
+    }
+  ],
+  "outputs": { "schema": "BusinessMapOutput" },
+  "approval": { "required": true, "reason": "事業状態に反映されるため" }
+}

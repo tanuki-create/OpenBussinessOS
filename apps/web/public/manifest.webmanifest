@@ -1,0 +1,25 @@
+{
+  "name": "Open Business OS",
+  "short_name": "Business OS",
+  "description": "Mobile-first business planning and execution OS MVP",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0f172a",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='36' fill='%230f172a'/%3E%3Cpath d='M48 62h96v20H48zM48 93h64v20H48zM48 124h96v20H48z' fill='%23ffffff'/%3E%3Cpath d='M124 92l22 13-22 13z' fill='%2314b8a6'/%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='96' fill='%230f172a'/%3E%3Cpath d='M128 164h256v52H128zM128 246h172v52H128zM128 328h256v52H128z' fill='%23ffffff'/%3E%3Cpath d='M334 244l58 34-58 34z' fill='%2314b8a6'/%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

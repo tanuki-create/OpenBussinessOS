@@ -1,0 +1,53 @@
+{
+  "providers": [
+    {
+      "id": "deepseek_direct",
+      "name": "DeepSeek Direct",
+      "type": "openai_compatible",
+      "base_url": "https://api.deepseek.com",
+      "auth": "bearer",
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "label": "DeepSeek V4 Flash",
+          "capabilities": ["json_output", "tool_calling", "reasoning", "long_context"],
+          "cost_profile": "ultra_cheap",
+          "default_for": [
+            "idea_intake",
+            "business_map_generation",
+            "metric_design",
+            "assumption_extraction",
+            "engineering_state_analysis",
+            "initiative_generation",
+            "implementation_breakdown",
+            "weekly_review"
+          ]
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "label": "DeepSeek V4 Pro",
+          "capabilities": ["json_output", "tool_calling", "reasoning", "long_context"],
+          "cost_profile": "premium",
+          "requires_confirmation": true,
+          "default_for": ["critical_strategy_review", "security_review"]
+        }
+      ]
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "type": "openai_compatible",
+      "base_url": "https://openrouter.ai/api/v1",
+      "auth": "bearer",
+      "dynamic_models": true
+    },
+    {
+      "id": "litellm_proxy",
+      "name": "LiteLLM Proxy",
+      "type": "openai_compatible",
+      "base_url_env": "LITELLM_PROXY_BASE_URL",
+      "auth": "bearer",
+      "dynamic_models": true
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "idea_intake",
+  "name": "Idea Intake",
+  "version": "0.1.0",
+  "stage": "intake",
+  "llm_task": "idea_intake",
+  "budget_mode": "cheap",
+  "inputs": { "required": ["project.one_liner"], "optional": ["workspace.default_budget_mode"] },
+  "questions": [
+    {
+      "id": "target_customer",
+      "text": "最初に使う人は誰ですか？",
+      "reason": "対象ユーザーが曖昧だと、指標・UX・営業施策が決められないためです。",
+      "input_type": "short_text"
+    }
+  ],
+  "outputs": { "schema": "IdeaIntakeOutput" },
+  "approval": { "required": false }
+}

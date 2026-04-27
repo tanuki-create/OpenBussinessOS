@@ -1,0 +1,11 @@
+{
+  "id": "weekly_review",
+  "name": "Weekly Review",
+  "version": "0.1.0",
+  "stage": "review",
+  "llm_task": "weekly_review",
+  "budget_mode": "cheap",
+  "inputs": { "required": ["review.summary", "assumptions"], "optional": ["evidence", "initiatives"] },
+  "outputs": { "schema": "ReviewRecommendationOutput" },
+  "approval": { "required": true, "reason": "仮説状態の更新提案を含むため" }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "initiative_generation",
+  "name": "2 Week Initiative Generation",
+  "version": "0.1.0",
+  "stage": "mvp_planning",
+  "llm_task": "initiative_generation",
+  "budget_mode": "cheap",
+  "inputs": { "required": ["project.one_liner", "business_map.assumptions"], "optional": ["metrics", "engineering_state"] },
+  "questions": [
+    {
+      "id": "first_success",
+      "text": "最初に証明したい仮説はどれですか？",
+      "reason": "2週間施策の成功条件を絞るためです。",
+      "input_type": "short_text"
+    }
+  ],
+  "outputs": { "schema": "InitiativeGenerationOutput" },
+  "approval": { "required": true, "reason": "生成された施策は実行計画に反映されるため" }
+}

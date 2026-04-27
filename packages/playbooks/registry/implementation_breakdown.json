@@ -1,0 +1,11 @@
+{
+  "id": "implementation_breakdown",
+  "name": "Implementation Breakdown",
+  "version": "0.1.0",
+  "stage": "execution",
+  "llm_task": "implementation_breakdown",
+  "budget_mode": "cheap",
+  "inputs": { "required": ["initiatives"], "optional": ["project_memory", "constraints"] },
+  "outputs": { "schema": "InitiativeGenerationOutput" },
+  "approval": { "required": true, "reason": "WorkItemとして外部Issueへ変換可能なため" }
+}
