@@ -22,7 +22,11 @@
 - Playbook output承認適用
 - Memory Graph / Project Memory Summary
 - WorkItemからGitHub Issue draft作成
-- Unit test対象のSecurity、Schema、LLM cost、RBAC helper
+- 承認済みToolActionからGitHub Issue dry-run / token実作成
+- PostgreSQL runtime Store
+- Browserless mobile E2E
+- token/local auth、workspace membership enforcement
+- Unit test対象のSecurity、Schema、LLM cost、RBAC helper、API auth境界
 
 ## 設計書との対応
 
@@ -37,6 +41,17 @@
 | 14.3 Markdown Export | Business Map、施策、WorkItem、Review、Decision LogのMarkdown出力 |
 
 ## テスト契約
+
+`tests/e2e-mobile.mjs` はブラウザやサーバーポートを起動せず、CIで軽く回せるmobile E2E契約を検証する。
+
+1. `index.html` がmobile viewport、theme color、manifest、app root、deferred JSを持つ
+2. `manifest.webmanifest` がstandalone / portrait / 192px・512px iconを持つ
+3. `service-worker.js` がapp shellをprecacheし、API requestをnetworkへ通し、navigation fallbackを持つ
+4. `styles.css` が320px最小幅、44px tap target、safe-area対応、fixed bottom navを持つ
+5. `app.js` が主要mobile workflow view、API endpoint、APIキー非永続化、Service Worker登録を持つ
+6. `handleApi` 直呼びでWorkspace -> API key -> Project -> Playbook Run -> approval -> Memory -> Initiative -> WorkItem -> ToolAction -> Review -> Markdown export -> Cost Summaryまで到達できる
+7. high_quality PlaybookとToolAction executeが承認なしで拒否される
+8. APIレスポンスとMarkdown exportにraw API key / `encrypted_key` が出ない
 
 `tests/smoke.mjs` は起動済みAPIに対し、以下を直列に検証する。
 
@@ -54,7 +69,22 @@
 12. Markdown exportに主要セクションとMemory Graphが含まれる
 13. Cost Summaryに非負の推定コストが含まれる
 
-`tests/unit.mjs` は実装済み helper を前提に、暗号化復号、redaction、schema validation、cost estimator、RBACを検証する。未実装の場合はskipせず、どのmodule/exportが不足しているか分かる形で失敗する。
+`tests/unit.mjs` は実装済み helper を前提に、暗号化復号、redaction、schema validation、cost estimator、RBAC、token auth modeの `/me` とowner/member/viewer/unauthenticated境界を検証する。未実装の場合はskipせず、どのmodule/exportが不足しているか分かる形で失敗する。
+
+ローカルでサーバー起動なしに回すCI寄りの確認:
+
+```sh
+npm run verify
+```
+
+サーバーを含めたfull smoke:
+
+```sh
+npm run dev
+BASE_URL=http://localhost:3000 npm run test:smoke
+```
+
+Playwrightはまだ導入しない。ブラウザdownloadがCI/ローカルの足止めにならない段階で、iPhone viewportの実レンダリング、スクリーンショット、テキストoverflow/overlap検査を追加する。
 
 ## セキュリティ注意点
 
@@ -64,17 +94,16 @@
 - Redaction helperはAPIキー、Bearer token、Authorization header、ネストしたログpayloadを対象にする。
 - RBACはUIではなくAPI側で強制する。OwnerのみAPIキー作成、Viewerは閲覧のみ、External Advisorは監査ログや機密設定にアクセス不可とする。
 - AI出力はStructured Outputとしてschema validationを通してから保存する。
-- 外部ツールへの書き込みはMVPではToolAction draftまでを原則とし、人間承認なしに実行しない。
+- 外部ツールへの書き込みはToolAction承認後のみ実行する。GitHub tokenがない場合はdry-runで完了する。
 
 ## 未実装/次フェーズ
 
-- Auth本実装、招待、セッション管理
-- PostgreSQL runtime repository
-- DeepSeek Direct Adapterの実通信と失敗時の正規化
-- Provider fallback / repair prompt
-- GitHub Issue実作成、Webhook draft
+- OIDC / secure cookie session、招待、チーム管理
+- Durable async queue
+- Provider fallback
+- Webhook / Slack connector
 - Playbook Registry、Provider Registry、Connector Registry
-- E2EのPlaywright化とAI eval scenario
+- Playwright mobile visual regressionとAI eval scenario
 
 ## レビュー観点
 

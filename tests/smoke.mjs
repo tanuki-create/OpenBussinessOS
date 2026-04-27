@@ -376,7 +376,8 @@ test("MVP API smoke workflow", async () => {
     payload: {
       title: "Add first business map export path",
       body: "## Why\nKeep the generated plan traceable before creating an external issue.",
-      labels: ["open-business-os", "mvp", "smoke"]
+      labels: ["open-business-os", "mvp", "smoke"],
+      source_work_item_id: workItem.id
     },
     preview:
       "Create a GitHub issue draft for the export work item. This must stay reviewable before execution."
@@ -399,6 +400,13 @@ test("MVP API smoke workflow", async () => {
     "project ToolAction list must include the created draft"
   );
 
+  const unapprovedExecuteResponse = await jsonRequest("POST", `/tool-actions/${toolActionId}/execute`, undefined, [409]);
+  assert.equal(
+    unapprovedExecuteResponse.data.error?.code,
+    "TOOL_ACTION_REQUIRES_APPROVAL",
+    "ToolAction execute must reject unapproved actions"
+  );
+
   const approvedToolActionResponse = await jsonRequest("POST", `/tool-actions/${toolActionId}/approve`);
   const approvedToolAction = unwrap(approvedToolActionResponse.data, ["toolAction", "tool_action"]);
   assert.equal(approvedToolAction.status, "approved", "ToolAction must be approved before execution");
@@ -410,11 +418,27 @@ test("MVP API smoke workflow", async () => {
   const executedToolActionResponse = await jsonRequest("POST", `/tool-actions/${toolActionId}/execute`);
   const executedToolAction = unwrap(executedToolActionResponse.data, ["toolAction", "tool_action"]);
   assert.equal(executedToolAction.status, "completed", "approved ToolAction execution must complete");
+  assert.equal(executedToolAction.result?.ok, true, "GitHub ToolAction result must be successful");
+  if (!process.env.OPEN_BUSINESS_OS_GITHUB_TOKEN && !process.env.OPEN_BUSINESS_OS_GITHUB_PAT) {
+    assert.equal(executedToolAction.result?.mode, "dry_run", "GitHub ToolAction must dry-run without an app GitHub token");
+  }
   assert.ok(
     executedToolAction.executedAt ?? executedToolAction.executed_at,
     "completed ToolAction must include an execution timestamp"
   );
   assertNoSecretLeak(executedToolAction, rawApiKey);
+
+  const projectAfterToolActionResponse = await jsonRequest("GET", `/projects/${projectId}`);
+  const workItemsAfterToolAction =
+    projectAfterToolActionResponse.data.workItems ?? projectAfterToolActionResponse.data.work_items ?? [];
+  const updatedWorkItem = workItemsAfterToolAction.find((item) => item.id === workItem.id);
+  assert.ok(updatedWorkItem, "project snapshot must still include the source work item");
+  if (executedToolAction.result?.mode === "real") {
+    assert.equal(updatedWorkItem.externalProvider ?? updatedWorkItem.external_provider, "github");
+    assert.ok(updatedWorkItem.externalUrl ?? updatedWorkItem.external_url, "real GitHub execution must store the issue URL");
+  } else {
+    assert.equal(updatedWorkItem.externalUrl ?? updatedWorkItem.external_url ?? null, null);
+  }
 
   const exportResponse = await rawRequest("GET", `/projects/${projectId}/export/markdown`, undefined, [200]);
   let markdown = exportResponse.text;

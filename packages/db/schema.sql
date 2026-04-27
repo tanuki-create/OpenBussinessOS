@@ -6,6 +6,7 @@ create extension if not exists pgcrypto;
 create table if not exists users (
   id uuid primary key default gen_random_uuid(),
   email text unique not null,
+  name text,
   display_name text,
   avatar_url text,
   created_at timestamptz not null default now(),
@@ -113,6 +114,14 @@ create table if not exists evidence (
   captured_at timestamptz default now(),
   created_by uuid references users(id),
   created_at timestamptz not null default now()
+);
+
+create table if not exists assumption_evidence (
+  assumption_id uuid not null references assumptions(id) on delete cascade,
+  evidence_id uuid not null references evidence(id) on delete cascade,
+  relation_type text not null default 'supports',
+  created_at timestamptz not null default now(),
+  primary key (assumption_id, evidence_id, relation_type)
 );
 
 create table if not exists decisions (
@@ -228,7 +237,7 @@ create table if not exists api_keys (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspaces(id) on delete cascade,
   provider text not null,
-  encrypted_key bytea not null,
+  encrypted_key text not null,
   key_hint text,
   status text not null default 'active' check (status in ('active','disabled','revoked')),
   created_by uuid references users(id),
@@ -286,7 +295,7 @@ create table if not exists audit_logs (
   actor_user_id uuid references users(id),
   action text not null,
   entity_type text,
-  entity_id uuid,
+  entity_id text,
   metadata jsonb not null default '{}'::jsonb,
   ip_address inet,
   user_agent text,
@@ -313,7 +322,7 @@ create table if not exists memory_nodes (
     node_type in ('vision','metric','assumption','evidence','decision','initiative','work_item','review','risk','constraint','preference','lesson','tool_action','ai_run')
   ),
   source_entity_type text,
-  source_entity_id uuid,
+  source_entity_id text,
   title text not null,
   body text,
   status text not null default 'draft'
@@ -372,3 +381,22 @@ create index if not exists idx_memory_nodes_source_entity on memory_nodes(source
 create index if not exists idx_memory_edges_from_relation on memory_edges(from_node_id, relation_type);
 create index if not exists idx_memory_edges_to_relation on memory_edges(to_node_id, relation_type);
 create index if not exists idx_project_memory_summaries_project_type on project_memory_summaries(project_id, summary_type, created_at desc);
+
+alter table users add column if not exists name text;
+alter table playbook_runs add column if not exists approved_by uuid references users(id);
+alter table playbook_runs add column if not exists approved_at timestamptz;
+alter table playbook_runs add column if not exists applied_at timestamptz;
+alter table playbook_runs add column if not exists memory_summary_id uuid;
+
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_name = 'api_keys' and column_name = 'encrypted_key' and data_type = 'bytea'
+  ) then
+    alter table api_keys alter column encrypted_key type text using encode(encrypted_key, 'escape');
+  end if;
+end $$;
+
+alter table audit_logs alter column entity_id type text using entity_id::text;
+alter table memory_nodes alter column source_entity_id type text using source_entity_id::text;

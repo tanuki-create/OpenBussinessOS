@@ -22,6 +22,7 @@ The current repository is a dependency-light MVP that runs locally with Node.js 
 
 - Node.js 22 or newer
 - npm
+- Docker, only if you want to run the PostgreSQL mode locally
 
 No database or external API key is required for the default local workflow.
 
@@ -66,6 +67,15 @@ http://localhost:3000
 
 The same server provides both the API and the mobile PWA shell.
 
+To run with PostgreSQL as the backing store:
+
+```sh
+docker compose up -d
+OPEN_BUSINESS_OS_STORE=postgres npm run dev
+```
+
+The server applies `packages/db/schema.sql` on startup unless `OPEN_BUSINESS_OS_INIT_DB=0` is set.
+
 ## First Run Workflow
 
 1. Create a workspace from the setup screen.
@@ -100,6 +110,34 @@ You can also save a workspace API key from the Settings screen. API keys are enc
 
 High-quality mode requires explicit approval before execution. The API also checks estimated live LLM cost against the workspace monthly budget before running.
 
+Live LLM output is parsed and schema-validated before it can be saved to project state. If live output is invalid JSON or fails the task schema, the server attempts one repair prompt; if repair fails, it records a failed `ai_run` and returns a reviewable error payload without applying invalid output.
+
+## GitHub Issue Execution
+
+GitHub Issue ToolActions always require approval before execution. Without an app GitHub token, execution completes as a dry-run so the approval flow remains testable offline.
+
+To create real issues after approval, start the server with:
+
+```sh
+OPEN_BUSINESS_OS_GITHUB_TOKEN=github_pat_here \
+OPEN_BUSINESS_OS_GITHUB_REPOSITORY=owner/repo \
+npm run dev
+```
+
+You can also set `OPEN_BUSINESS_OS_GITHUB_OWNER` and `OPEN_BUSINESS_OS_GITHUB_REPO` instead of `OPEN_BUSINESS_OS_GITHUB_REPOSITORY`. On successful real execution, the source WorkItem stores `external_provider`, `external_id`, and `external_url`.
+
+## Authentication Mode
+
+The default `OPEN_BUSINESS_OS_AUTH_MODE=local` keeps local development and tests zero-config. It authenticates as the built-in local user, and the `x-open-business-os-role` header remains available only in this mode for RBAC checks.
+
+For a self-hosted token-gated MVP, start with token mode:
+
+```sh
+OPEN_BUSINESS_OS_AUTH_MODE=token OPEN_BUSINESS_OS_API_TOKEN=change-me npm run dev
+```
+
+The API accepts bearer tokens, `x-open-business-os-token` / `x-api-token`, and the `obos_session` session cookie. Use `OPEN_BUSINESS_OS_AUTH_TOKENS` to map multiple tokens to existing user ids, for example `{"owner-token":{"userId":"..."}}`. In token mode, `/api/v1/me` reflects the authenticated user, workspace reads are membership-scoped, and write endpoints reject missing or invalid tokens.
+
 ## Useful Commands
 
 Run a quick syntax check:
@@ -114,6 +152,18 @@ Run unit tests:
 npm test
 ```
 
+Run the browserless mobile E2E/PWA contract check:
+
+```sh
+npm run test:e2e
+```
+
+Run the CI-friendly verification bundle that does not need a listening server:
+
+```sh
+npm run verify
+```
+
 Run the smoke workflow:
 
 ```sh
@@ -121,7 +171,23 @@ npm run dev
 BASE_URL=http://localhost:3000 npm run test:smoke
 ```
 
-The smoke test expects the local server to already be running.
+The smoke test expects the local server to already be running. `test:e2e` starts no browser and opens no port; it validates the mobile-critical static PWA assets plus the API workflow contract through the in-process handler. A Playwright mobile viewport/screenshot suite remains the follow-up for real rendering and overlap checks.
+
+Full local verification before a handoff:
+
+```sh
+npm run verify
+npm run dev
+BASE_URL=http://localhost:3000 npm run test:smoke
+```
+
+For PostgreSQL smoke testing, start the server in PostgreSQL mode first:
+
+```sh
+docker compose up -d
+OPEN_BUSINESS_OS_STORE=postgres npm run dev
+BASE_URL=http://localhost:3000 npm run test:smoke
+```
 
 ## Local Data
 
@@ -137,16 +203,16 @@ The `data/` directory is ignored by Git. If you want to start from a clean local
 
 - `apps/api/src/server.js` serves the JSON API and the static PWA files.
 - `apps/api/src/store.js` provides the local JSON store.
-- `apps/api/src/repositories/` contains the repository boundary for moving from JSON storage to PostgreSQL.
+- `apps/api/src/repositories/` contains JSON and PostgreSQL store/runtime support.
 - `apps/web/public/` contains the dependency-free mobile PWA.
 - `packages/llm-gateway/` contains sample output, cost estimation, and DeepSeek-compatible request helpers.
 - `packages/schemas/` validates structured AI output.
 - `packages/security/` handles encryption, redaction, RBAC, and audit helpers.
 - `packages/db/schema.sql` is the target PostgreSQL schema.
 
-## Database Direction
+## Database
 
-The MVP currently uses a local JSON store for zero-dependency development. A Repository boundary now separates API code from the backing store, and the target source of truth remains PostgreSQL.
+The default local mode uses a JSON store for zero-friction development. PostgreSQL runtime mode is also available through `OPEN_BUSINESS_OS_STORE=postgres` and `DATABASE_URL`.
 
 Long-term project memory is represented as:
 
@@ -166,4 +232,4 @@ See [packages/db/schema.sql](packages/db/schema.sql) and [docs/memory-architectu
 
 ## Project Status
 
-This is still an MVP. It is suitable for local exploration, product workflow testing, and design iteration. The next major work is PostgreSQL runtime persistence, real authentication, GitHub Issue execution after approval, and mobile E2E tests.
+This is still an MVP, but the main local workflow, token-based auth, PostgreSQL runtime path, GitHub Issue ToolAction execution, Memory Graph, and browserless mobile E2E contract are now in place. The next major work is OIDC/secure-cookie auth, durable async queues, provider fallback, and Playwright-based mobile visual regression.

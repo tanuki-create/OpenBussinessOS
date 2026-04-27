@@ -5,6 +5,7 @@ module.exports = {
   ...require("./policy-routing"),
   ...require("./cost-estimator"),
   ...require("./sample-output"),
+  ...require("./structured-output"),
   ...require("./cost"),
   ...require("./deepseek"),
   ...require("./policy"),

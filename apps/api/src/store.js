@@ -247,6 +247,7 @@ module.exports = {
   createAuditLog,
   createDefaultData,
   createId,
+  normalizeData,
   nowIso,
   publicApiKey,
 };

@@ -14,14 +14,24 @@ const {
   publicApiKey
 } = require("./store");
 const { createStore } = require("./repositories");
+const { executeGitHubIssueAction } = require("./connectors/github");
+const {
+  authenticateRequest,
+  currentUserId,
+  membershipsForCurrentUser,
+  requireAuthenticated,
+  requireWorkspacePermission,
+  requireWorkspaceRead
+} = require("./auth");
 const { encryptSecret, decryptSecret, keyHint } = require("./security");
-const { can } = require("../../../packages/security/src");
 const {
   buildDeepSeekChatRequest,
   callDeepSeek,
   estimateCost,
   estimateRunCost,
   estimateTokens,
+  buildJsonRepairChatRequest,
+  parseStructuredJson,
   sampleBusinessMap,
   sampleForTask,
   sampleInitiatives
@@ -123,25 +133,6 @@ function workspaceFor(data, workspaceId) {
   return data.workspaces.find((workspace) => workspace.id === workspaceId);
 }
 
-function roleForWorkspace(data, request, workspaceId) {
-  const requestedRole = request.headers["x-open-business-os-role"];
-  if (requestedRole) return String(requestedRole).toLowerCase();
-  return data.workspace_memberships.find(
-    (membership) => membership.workspace_id === workspaceId && membership.user_id === DEFAULT_USER_ID
-  )?.role || "viewer";
-}
-
-function requireWorkspacePermission(data, request, workspaceId, action) {
-  const role = roleForWorkspace(data, request, workspaceId);
-  if (!can(role, action)) {
-    const error = new Error(`Role ${role || "none"} cannot perform ${action}.`);
-    error.code = "FORBIDDEN";
-    error.details = { workspaceId, action, role };
-    throw error;
-  }
-  return role;
-}
-
 function exposeWorkspace(workspace) {
   return {
     ...workspace,
@@ -223,6 +214,44 @@ function buildGitHubIssueDraft(project, initiative, workItem, options = {}) {
   };
 }
 
+function updateSourceWorkItemFromGitHubResult(data, action, result) {
+  if (!result?.ok || result.mode !== "real" || !result.externalUrl) return null;
+  const workItemId = action.payload?.source_work_item_id || result.source_work_item_id;
+  if (!workItemId) return null;
+
+  const workItem = data.work_items.find((item) => item.id === workItemId);
+  if (!workItem) return null;
+
+  workItem.external_provider = result.externalProvider || "github";
+  workItem.external_id = result.externalId || (result.issue?.number ? String(result.issue.number) : null);
+  workItem.external_url = result.externalUrl;
+  workItem.updated_at = nowIso();
+  return workItem;
+}
+
+async function executeToolAction(data, action) {
+  if (action.tool_provider === "github" && action.action_type === "issue_create") {
+    const result = await executeGitHubIssueAction(action);
+    const workItem = updateSourceWorkItemFromGitHubResult(data, action, result);
+    return {
+      result,
+      updatedWorkItemId: workItem?.id || null,
+      updatedProjectId: workItem?.project_id || null
+    };
+  }
+
+  return {
+    result: {
+      ok: true,
+      provider: action.tool_provider,
+      operation: action.action_type,
+      mode: "stub"
+    },
+    updatedWorkItemId: null,
+    updatedProjectId: null
+  };
+}
+
 function exposeReview(review) {
   return {
     ...review,
@@ -267,6 +296,7 @@ function exposePlaybookRun(run) {
 function addAudit(data, request, workspaceId, action, entityType, entityId, metadata = {}) {
   data.audit_logs.push(createAuditLog({
     workspaceId,
+    actorUserId: currentUserId(request),
     action,
     entityType,
     entityId,
@@ -312,24 +342,72 @@ function costSummary(data, workspaceId) {
   };
 }
 
-function validateLlmOutputForTask(task, output) {
-  let validation = null;
+function validationForLlmTask(task, output) {
   if (task === "business_map_generation" || task === "metric_design" || task === "assumption_extraction") {
-    validation = validateBusinessMapOutput(output);
-  } else if (task === "initiative_generation" || task === "implementation_breakdown") {
-    validation = validateInitiativeGenerationOutput(output);
-  } else if (task === "engineering_state_analysis") {
-    validation = validateEngineeringStateAnalysisOutput(output);
+    return validateBusinessMapOutput(output);
   }
+  if (task === "initiative_generation" || task === "implementation_breakdown") {
+    return validateInitiativeGenerationOutput(output);
+  }
+  if (task === "engineering_state_analysis") {
+    return validateEngineeringStateAnalysisOutput(output);
+  }
+  return null;
+}
 
+function llmSchemaError(message, details = {}) {
+  const error = new Error(message);
+  error.code = "SCHEMA_VALIDATION_FAILED";
+  error.details = details;
+  return error;
+}
+
+function outputPreview(content, maxLength = 1000) {
+  const text = String(content ?? "");
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}...`;
+}
+
+function validateLlmOutputForTask(task, output) {
+  const validation = validationForLlmTask(task, output);
   if (validation && !validation.ok) {
-    const error = new Error(`${validation.schemaName} validation failed.`);
-    error.code = "SCHEMA_VALIDATION_FAILED";
-    error.details = { errors: validation.errors };
-    throw error;
+    throw llmSchemaError(`${validation.schemaName} validation failed.`, {
+      reason: "schema_validation",
+      schemaName: validation.schemaName,
+      errors: validation.errors
+    });
   }
 
   return output;
+}
+
+function parseAndValidateLlmContent(task, content) {
+  const parsed = parseStructuredJson(content);
+  if (!parsed.ok) {
+    throw llmSchemaError("LLM response was not valid JSON.", {
+      reason: "invalid_json",
+      parseError: parsed.error,
+      outputPreview: outputPreview(content)
+    });
+  }
+
+  validateLlmOutputForTask(task, parsed.value);
+  return parsed.value;
+}
+
+function providerError(error) {
+  const next = new Error(error.status === 429 ? "LLM provider rate limit exceeded." : "LLM provider request failed.");
+  next.code = error.status === 429 ? "LLM_RATE_LIMITED" : "LLM_PROVIDER_ERROR";
+  next.details = {
+    status: error.status || null,
+    message: error.message || "Provider request failed."
+  };
+  return next;
+}
+
+function attachLlmContext(error, { provider, model }) {
+  error.provider = provider;
+  error.model = model;
+  return error;
 }
 
 function estimatePlannedAiCost({ model, input, maxOutputTokens = 1600 }) {
@@ -662,7 +740,7 @@ function getWorkspaceApiKey(data, workspaceId, provider = "deepseek_direct") {
   return null;
 }
 
-function createAiAccounting(data, { workspaceId, projectId, task, input, output, provider = "sample", model = "sample-local", budgetMode = "cheap", status = "success", error = null }) {
+function createAiAccounting(data, { workspaceId, projectId, task, input, output, provider = "sample", model = "sample-local", budgetMode = "cheap", status = "success", error = null, createdBy = DEFAULT_USER_ID }) {
   const usage = estimateRunCost({ model, input, output });
   const aiRun = {
     id: createId(),
@@ -681,7 +759,7 @@ function createAiAccounting(data, { workspaceId, projectId, task, input, output,
     latency_ms: 0,
     status,
     error,
-    created_by: DEFAULT_USER_ID,
+    created_by: createdBy,
     created_at: nowIso()
   };
   data.ai_runs.push(aiRun);
@@ -715,11 +793,24 @@ function memoryContextForRun(data, project) {
   };
 }
 
-async function generatePlaybookOutput(data, { workspaceId, project, task, input, budgetMode = "cheap", approvedHighCost = false }) {
-  const liveEnabled = process.env.OPEN_BUSINESS_OS_LIVE_LLM === "1";
-  const model = budgetMode === "high_quality" || task === "critical_strategy_review" || task === "security_review"
+function modelForLlmTask(task, budgetMode = "cheap") {
+  return budgetMode === "high_quality" || task === "critical_strategy_review" || task === "security_review"
     ? "deepseek-v4-pro"
     : "deepseek-v4-flash";
+}
+
+function providerForFailedGeneration(error) {
+  return error.provider || (process.env.OPEN_BUSINESS_OS_LIVE_LLM === "1" ? "deepseek_direct" : "sample");
+}
+
+function modelForFailedGeneration(error, task, budgetMode) {
+  if (error.model) return error.model;
+  return process.env.OPEN_BUSINESS_OS_LIVE_LLM === "1" ? modelForLlmTask(task, budgetMode) : "sample-local";
+}
+
+async function generatePlaybookOutput(data, { workspaceId, project, task, input, budgetMode = "cheap", approvedHighCost = false }) {
+  const liveEnabled = process.env.OPEN_BUSINESS_OS_LIVE_LLM === "1";
+  const model = modelForLlmTask(task, budgetMode);
   const maxOutputTokens = task === "critical_strategy_review" ? 4000 : task === "implementation_breakdown" ? 2500 : 2200;
   const memoryContext = memoryContextForRun(data, project);
   const effectiveInput = memoryContext
@@ -783,16 +874,20 @@ async function generatePlaybookOutput(data, { workspaceId, project, task, input,
     maxOutputTokens
   });
 
-  const response = await callDeepSeek({
-    apiKey,
-    baseUrl: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com",
-    request
-  });
+  let response;
+  try {
+    response = await callDeepSeek({
+      apiKey,
+      baseUrl: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com",
+      request
+    });
+  } catch (error) {
+    throw attachLlmContext(providerError(error), { provider: "deepseek_direct", model });
+  }
   const content = response.choices?.[0]?.message?.content || "{}";
 
   try {
-    const output = JSON.parse(content);
-    validateLlmOutputForTask(task, output);
+    const output = parseAndValidateLlmContent(task, content);
     return {
       output,
       provider: "deepseek_direct",
@@ -800,15 +895,61 @@ async function generatePlaybookOutput(data, { workspaceId, project, task, input,
       input: effectiveInput,
       memoryContext
     };
-  } catch (parseError) {
-    const error = new Error("DeepSeek response was not valid JSON.");
-    error.code = "SCHEMA_VALIDATION_FAILED";
-    error.details = { parseError: parseError.message };
-    throw error;
+  } catch (initialError) {
+    const repairRequest = buildJsonRepairChatRequest({
+      model,
+      task,
+      input: effectiveInput,
+      invalidContent: content,
+      parseError: initialError.details?.parseError || null,
+      validationErrors: initialError.details?.errors || null,
+      maxOutputTokens
+    });
+    let repairResponse;
+    try {
+      repairResponse = await callDeepSeek({
+        apiKey,
+        baseUrl: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com",
+        request: repairRequest
+      });
+    } catch (error) {
+      initialError.details = {
+        ...(initialError.details || {}),
+        repairAttempted: true,
+        repairProviderError: providerError(error).details
+      };
+      throw attachLlmContext(initialError, { provider: "deepseek_direct", model });
+    }
+
+    const repairedContent = repairResponse.choices?.[0]?.message?.content || "{}";
+    try {
+      const repairedOutput = parseAndValidateLlmContent(task, repairedContent);
+      return {
+        output: repairedOutput,
+        provider: "deepseek_direct",
+        model,
+        input: effectiveInput,
+        memoryContext,
+        repair: {
+          attempted: true,
+          succeeded: true
+        }
+      };
+    } catch (repairError) {
+      throw attachLlmContext(
+        llmSchemaError("DeepSeek response failed JSON/schema validation after repair.", {
+          reason: "repair_failed",
+          repairAttempted: true,
+          initial: initialError.details || {},
+          repair: repairError.details || {}
+        }),
+        { provider: "deepseek_direct", model }
+      );
+    }
   }
 }
 
-function applyBusinessMapOutput(data, project, output, { status = "draft", approvedBy = null } = {}) {
+function applyBusinessMapOutput(data, project, output, { status = "draft", approvedBy = null, createdBy = DEFAULT_USER_ID } = {}) {
   const validation = validateBusinessMapOutput(output);
   if (!validation.ok) {
     const error = new Error("BusinessMapOutput failed validation.");
@@ -822,7 +963,7 @@ function applyBusinessMapOutput(data, project, output, { status = "draft", appro
   const businessMap = existingMap || {
     id: createId(),
     project_id: project.id,
-    created_by: DEFAULT_USER_ID,
+    created_by: createdBy,
     created_at: now
   };
   Object.assign(businessMap, {
@@ -863,7 +1004,7 @@ function applyBusinessMapOutput(data, project, output, { status = "draft", appro
         id: createId(),
         project_id: project.id,
         statement: assumption.statement,
-        created_by: DEFAULT_USER_ID,
+        created_by: createdBy,
         created_at: now
       };
       data.assumptions.push(stored);
@@ -882,7 +1023,7 @@ function applyBusinessMapOutput(data, project, output, { status = "draft", appro
   return output;
 }
 
-function ensureBusinessMap(data, project) {
+function ensureBusinessMap(data, project, actorUserId = DEFAULT_USER_ID) {
   const existing = data.business_maps.find((map) => map.project_id === project.id && map.status !== "archived");
   if (existing) {
     connectProjectMemoryGraph(data, project);
@@ -890,18 +1031,19 @@ function ensureBusinessMap(data, project) {
   }
 
   const output = sampleBusinessMap({ one_liner: project.one_liner, project });
-  applyBusinessMapOutput(data, project, output);
+  applyBusinessMapOutput(data, project, output, { createdBy: actorUserId });
   createAiAccounting(data, {
     workspaceId: project.workspace_id,
     projectId: project.id,
     task: "business_map_generation",
     input: project.one_liner,
-    output
+    output,
+    createdBy: actorUserId
   });
   return output;
 }
 
-function createInitiativesFromOutput(data, project, output) {
+function createInitiativesFromOutput(data, project, output, actorUserId = DEFAULT_USER_ID) {
   const validation = validateInitiativeGenerationOutput(output);
   if (!validation.ok) {
     const error = new Error("InitiativeGenerationOutput failed validation.");
@@ -939,7 +1081,7 @@ function createInitiativesFromOutput(data, project, output) {
       priority: item.priority,
       related_metric_id: relatedMetric?.id || null,
       related_assumption_id: relatedAssumption?.id || null,
-      created_by: DEFAULT_USER_ID,
+      created_by: actorUserId,
       created_at: nowIso(),
       updated_at: nowIso()
     };
@@ -961,7 +1103,7 @@ function createInitiativesFromOutput(data, project, output) {
         external_provider: null,
         external_id: null,
         external_url: null,
-        created_by: DEFAULT_USER_ID,
+        created_by: actorUserId,
         created_at: nowIso(),
         updated_at: nowIso()
       };
@@ -975,7 +1117,8 @@ function createInitiativesFromOutput(data, project, output) {
     projectId: project.id,
     task: "initiative_generation",
     input: project.one_liner,
-    output
+    output,
+    createdBy: actorUserId
   });
   connectProjectMemoryGraph(data, project);
   return { initiatives: createdInitiatives, workItems: createdWorkItems };
@@ -984,6 +1127,12 @@ function createInitiativesFromOutput(data, project, output) {
 function applyPlaybookRunOutput(data, run, approvedBy = DEFAULT_USER_ID) {
   if (run.status === "applied") {
     const error = new Error("PlaybookRun output has already been applied.");
+    error.code = "VALIDATION_ERROR";
+    error.details = { runId: run.id, status: run.status };
+    throw error;
+  }
+  if (run.status === "failed" || !run.output) {
+    const error = new Error("PlaybookRun has no valid output to apply.");
     error.code = "VALIDATION_ERROR";
     error.details = { runId: run.id, status: run.status };
     throw error;
@@ -1001,11 +1150,12 @@ function applyPlaybookRunOutput(data, run, approvedBy = DEFAULT_USER_ID) {
     applied = {
       businessMap: applyBusinessMapOutput(data, project, run.output, {
         status: "approved",
-        approvedBy
+        approvedBy,
+        createdBy: approvedBy
       })
     };
   } else if (run.playbook_id === "initiative_generation" || run.playbook_id === "implementation_breakdown") {
-    applied = createInitiativesFromOutput(data, project, run.output);
+    applied = createInitiativesFromOutput(data, project, run.output, approvedBy);
   } else {
     const error = new Error("This playbook output cannot be applied to Project State.");
     error.code = "VALIDATION_ERROR";
@@ -1059,8 +1209,8 @@ function refreshProjectMemorySummary(data, project) {
   return summary;
 }
 
-function markdownForProject(data, project) {
-  const businessMap = ensureBusinessMap(data, project);
+function markdownForProject(data, project, actorUserId = DEFAULT_USER_ID) {
+  const businessMap = ensureBusinessMap(data, project, actorUserId);
   const initiatives = data.initiatives.filter((item) => item.project_id === project.id);
   const workItems = data.work_items.filter((item) => item.project_id === project.id);
   const reviews = data.reviews.filter((item) => item.project_id === project.id);
@@ -1175,34 +1325,53 @@ async function handleApi(store, request, response, url) {
   const method = request.method || "GET";
   const pathname = url.pathname.slice(API_PREFIX.length) || "/";
   const parts = pathname.split("/").filter(Boolean);
+  request.auth = authenticateRequest(store.snapshot, request);
 
   if (method === "GET" && pathname === "/health") {
     sendJson(response, 200, { ok: true, service: "open-business-os-api" });
     return;
   }
 
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    requireAuthenticated(request);
+  }
+
   if (method === "GET" && pathname === "/me") {
     const data = store.snapshot;
-    const user = data.users.find((item) => item.id === DEFAULT_USER_ID);
-    const memberships = data.workspace_memberships.filter((item) => item.user_id === DEFAULT_USER_ID);
-    sendJson(response, 200, { user, memberships });
+    const auth = requireAuthenticated(request);
+    const memberships = membershipsForCurrentUser(data, request);
+    sendJson(response, 200, {
+      user: auth.user,
+      memberships,
+      auth: {
+        mode: auth.mode,
+        tokenSource: auth.tokenSource
+      }
+    });
     return;
   }
 
   if (method === "GET" && pathname === "/workspaces") {
-    sendJson(response, 200, { workspaces: store.repositoriesFor().workspaces.all().map(exposeWorkspace) });
+    const memberships = membershipsForCurrentUser(store.snapshot, request);
+    const workspaceIds = new Set(memberships.map((membership) => membership.workspace_id));
+    const workspaces = store.repositoriesFor().workspaces.all()
+      .filter((workspace) => workspaceIds.has(workspace.id))
+      .map(exposeWorkspace);
+    sendJson(response, 200, { workspaces });
     return;
   }
 
   if (method === "POST" && pathname === "/workspaces") {
+    requireAuthenticated(request);
     const body = await readJsonBody(request);
     const result = await store.transaction(async (data) => {
       const now = nowIso();
+      const actorId = currentUserId(request);
       const workspace = {
         id: createId(),
         name: requireField(body, "name"),
         slug: toSlug(body.slug || body.name),
-        owner_user_id: DEFAULT_USER_ID,
+        owner_user_id: actorId,
         default_budget_mode: body.defaultBudgetMode || body.default_budget_mode || "cheap",
         monthly_budget_usd: Number(body.monthlyBudgetUsd || body.monthly_budget_usd || 5),
         created_at: now,
@@ -1211,7 +1380,7 @@ async function handleApi(store, request, response, url) {
       data.workspaces.push(workspace);
       data.workspace_memberships.push({
         workspace_id: workspace.id,
-        user_id: DEFAULT_USER_ID,
+        user_id: actorId,
         role: "owner",
         created_at: now
       });
@@ -1238,6 +1407,7 @@ async function handleApi(store, request, response, url) {
     if (method === "GET" && parts.length === 2) {
       const workspace = workspaceFor(store.snapshot, workspaceId);
       if (!workspace) return notFound(response);
+      requireWorkspaceRead(store.snapshot, request, workspaceId);
       sendJson(response, 200, { workspace: exposeWorkspace(workspace) });
       return;
     }
@@ -1269,11 +1439,13 @@ async function handleApi(store, request, response, url) {
     }
 
     if (method === "GET" && parts[2] === "costs" && parts[3] === "summary") {
+      requireWorkspaceRead(store.snapshot, request, workspaceId);
       sendJson(response, 200, { costSummary: costSummary(store.snapshot, workspaceId) });
       return;
     }
 
     if (parts[2] === "api-keys" && method === "GET") {
+      requireWorkspacePermission(store.snapshot, request, workspaceId, "api_key:create");
       const keys = store.snapshot.api_keys
         .filter((key) => key.workspace_id === workspaceId)
         .map(exposeApiKey);
@@ -1298,6 +1470,7 @@ async function handleApi(store, request, response, url) {
         }
         requireWorkspacePermission(data, request, workspaceId, "api_key:create");
         const now = nowIso();
+        const actorId = currentUserId(request);
         const existing = data.api_keys.find((key) => key.workspace_id === workspaceId && key.provider === provider);
         const record = {
           id: existing?.id || createId(),
@@ -1306,7 +1479,7 @@ async function handleApi(store, request, response, url) {
           encrypted_key: encryptSecret(apiKey),
           key_hint: keyHint(apiKey),
           status: "active",
-          created_by: DEFAULT_USER_ID,
+          created_by: actorId,
           created_at: existing?.created_at || now,
           updated_at: now
         };
@@ -1324,6 +1497,7 @@ async function handleApi(store, request, response, url) {
 
     if (parts[2] === "api-keys" && parts[3] === "test" && method === "POST") {
       const body = await readJsonBody(request);
+      requireWorkspacePermission(store.snapshot, request, workspaceId, "api_key:create");
       const provider = body.provider || "deepseek_direct";
       const key = store.snapshot.api_keys.find((item) => item.workspace_id === workspaceId && item.provider === provider && item.status === "active");
       sendJson(response, 200, {
@@ -1335,6 +1509,7 @@ async function handleApi(store, request, response, url) {
     }
 
     if (parts[2] === "api-keys" && parts[4] === "test" && method === "POST") {
+      requireWorkspacePermission(store.snapshot, request, workspaceId, "api_key:create");
       const key = store.snapshot.api_keys.find((item) => item.id === parts[3] && item.workspace_id === workspaceId);
       if (!key) return notFound(response);
       sendJson(response, 200, { ok: true, provider: key.provider, keyHint: key.key_hint });
@@ -1344,8 +1519,12 @@ async function handleApi(store, request, response, url) {
 
   if (method === "GET" && pathname === "/projects") {
     const workspaceId = url.searchParams.get("workspaceId") || url.searchParams.get("workspace_id");
+    const accessibleWorkspaceIds = workspaceId
+      ? new Set([workspaceId])
+      : new Set(membershipsForCurrentUser(store.snapshot, request).map((membership) => membership.workspace_id));
+    if (workspaceId) requireWorkspaceRead(store.snapshot, request, workspaceId);
     const projects = store.snapshot.projects
-      .filter((project) => !workspaceId || project.workspace_id === workspaceId)
+      .filter((project) => accessibleWorkspaceIds.has(project.workspace_id))
       .map(exposeProject);
     sendJson(response, 200, { projects });
     return;
@@ -1362,6 +1541,7 @@ async function handleApi(store, request, response, url) {
       }
       requireWorkspacePermission(data, request, workspaceId, "project:create");
       const now = nowIso();
+      const actorId = currentUserId(request);
       const project = {
         id: createId(),
         workspace_id: workspaceId,
@@ -1369,7 +1549,7 @@ async function handleApi(store, request, response, url) {
         one_liner: body.oneLiner || body.one_liner || body.idea || "",
         business_type: body.businessType || body.business_type || null,
         status: "active",
-        created_by: DEFAULT_USER_ID,
+        created_by: actorId,
         created_at: now,
         updated_at: now
       };
@@ -1385,6 +1565,7 @@ async function handleApi(store, request, response, url) {
     const projectId = parts[1];
     const project = projectFor(store.snapshot, projectId);
     if (!project) return notFound(response);
+    requireWorkspaceRead(store.snapshot, request, project.workspace_id);
 
     if (method === "GET" && parts.length === 2) {
       const snapshot = store.repositoriesFor().projects.snapshot(projectId);
@@ -1401,7 +1582,7 @@ async function handleApi(store, request, response, url) {
     }
 
     if (method === "GET" && parts[2] === "business-map") {
-      const businessMap = await store.transaction(async (data) => ensureBusinessMap(data, project));
+      const businessMap = await store.transaction(async (data) => ensureBusinessMap(data, project, currentUserId(request)));
       sendJson(response, 200, { businessMap, business_map: businessMap });
       return;
     }
@@ -1419,9 +1600,10 @@ async function handleApi(store, request, response, url) {
       if (body.generate === true || !body.title) {
         const result = await store.transaction(async (data) => {
           requireWorkspacePermission(data, request, project.workspace_id, "work_item:create");
-          const businessMap = ensureBusinessMap(data, project);
+          const actorId = currentUserId(request);
+          const businessMap = ensureBusinessMap(data, project, actorId);
           const output = sampleInitiatives({ one_liner: project.one_liner, businessMap });
-          return createInitiativesFromOutput(data, project, output);
+          return createInitiativesFromOutput(data, project, output, actorId);
         });
         sendJson(response, 201, {
           initiatives: result.initiatives.map(exposeInitiative),
@@ -1433,6 +1615,7 @@ async function handleApi(store, request, response, url) {
       const result = await store.transaction(async (data) => {
         requireWorkspacePermission(data, request, project.workspace_id, "work_item:create");
         const now = nowIso();
+        const actorId = currentUserId(request);
         const initiative = {
           id: createId(),
           project_id: projectId,
@@ -1447,7 +1630,7 @@ async function handleApi(store, request, response, url) {
           priority: body.priority || "medium",
           related_metric_id: body.relatedMetricId || body.related_metric_id || null,
           related_assumption_id: body.relatedAssumptionId || body.related_assumption_id || null,
-          created_by: DEFAULT_USER_ID,
+          created_by: actorId,
           created_at: now,
           updated_at: now
         };
@@ -1473,6 +1656,7 @@ async function handleApi(store, request, response, url) {
       const result = await store.transaction(async (data) => {
         requireWorkspacePermission(data, request, project.workspace_id, "work_item:create");
         const now = nowIso();
+        const actorId = currentUserId(request);
         const workItem = {
           id: createId(),
           project_id: projectId,
@@ -1487,7 +1671,7 @@ async function handleApi(store, request, response, url) {
           external_provider: null,
           external_id: null,
           external_url: null,
-          created_by: DEFAULT_USER_ID,
+          created_by: actorId,
           created_at: now,
           updated_at: now
         };
@@ -1512,6 +1696,7 @@ async function handleApi(store, request, response, url) {
       const body = await readJsonBody(request);
       const result = await store.transaction(async (data) => {
         requireWorkspacePermission(data, request, project.workspace_id, "review:create");
+        const actorId = currentUserId(request);
         const review = {
           id: createId(),
           project_id: projectId,
@@ -1522,7 +1707,7 @@ async function handleApi(store, request, response, url) {
           summary: body.summary || [body.done, body.evidence, body.metric].filter(Boolean).join(" / "),
           learnings: body.learnings || (body.evidence ? [body.evidence] : []),
           next_actions: body.nextActions || body.next_actions || ["次の施策候補を確認する"],
-          created_by: DEFAULT_USER_ID,
+          created_by: actorId,
           created_at: nowIso()
         };
         data.reviews.push(review);
@@ -1561,7 +1746,8 @@ async function handleApi(store, request, response, url) {
           status: body.status || "active",
           importance: body.importance,
           confidence: body.confidence,
-          metadata: body.metadata || {}
+          metadata: body.metadata || {},
+          created_by: currentUserId(request)
         });
         addAudit(data, request, project.workspace_id, "memory_node.upsert", "memory_node", node.id, { project_id: project.id });
         return node;
@@ -1581,7 +1767,8 @@ async function handleApi(store, request, response, url) {
           to_node_id: body.toNodeId || body.to_node_id,
           relation_type: body.relationType || body.relation_type,
           strength: body.strength,
-          metadata: body.metadata || {}
+          metadata: body.metadata || {},
+          created_by: currentUserId(request)
         });
         if (!edge) {
           const error = new Error("Valid fromNodeId, toNodeId, and relationType are required.");
@@ -1611,7 +1798,7 @@ async function handleApi(store, request, response, url) {
     }
 
     if (parts[2] === "export" && parts[3] === "markdown" && method === "GET") {
-      const markdown = await store.transaction(async (data) => markdownForProject(data, project));
+      const markdown = await store.transaction(async (data) => markdownForProject(data, project, currentUserId(request)));
       send(response, 200, markdown, {
         "content-type": "text/markdown; charset=utf-8",
         "cache-control": "no-store"
@@ -1644,19 +1831,80 @@ async function handleApi(store, request, response, url) {
     const result = await store.transaction(async (data) => {
       const project = body.projectId || body.project_id ? projectFor(data, body.projectId || body.project_id) : null;
       const workspaceId = body.workspaceId || body.workspace_id || project?.workspace_id || DEFAULT_WORKSPACE_ID;
+      if (project && project.workspace_id !== workspaceId) {
+        const error = new Error("workspaceId must match the requested project workspace.");
+        error.code = "VALIDATION_ERROR";
+        error.details = { workspaceId, projectWorkspaceId: project.workspace_id };
+        throw error;
+      }
       const playbookId = body.playbookId || body.playbook_id || "idea_intake";
       const budgetMode = body.budgetMode || body.budget_mode || "cheap";
       const rawInput = body.input || body.inputs || {};
       const input = { ...rawInput, one_liner: rawInput.oneLiner || rawInput.one_liner || rawInput.idea || project?.one_liner };
       requireWorkspacePermission(data, request, workspaceId, "ai.run");
-      const generated = await generatePlaybookOutput(data, {
-        workspaceId,
-        project,
-        task: playbookId,
-        input,
-        budgetMode,
-        approvedHighCost: Boolean(body.approvedHighCost || body.approved_high_cost)
-      });
+      const actorId = currentUserId(request);
+      let generated;
+      try {
+        generated = await generatePlaybookOutput(data, {
+          workspaceId,
+          project,
+          task: playbookId,
+          input,
+          budgetMode,
+          approvedHighCost: Boolean(body.approvedHighCost || body.approved_high_cost)
+        });
+      } catch (error) {
+        const now = nowIso();
+        const failedRun = {
+          id: createId(),
+          workspace_id: workspaceId,
+          project_id: project?.id || body.projectId || body.project_id || null,
+          playbook_id: playbookId,
+          input,
+          output: null,
+          status: "failed",
+          created_by: actorId,
+          started_at: now,
+          completed_at: now,
+          created_at: now,
+          memory_summary_id: null
+        };
+        data.playbook_runs.push(failedRun);
+        const accounting = createAiAccounting(data, {
+          workspaceId,
+          projectId: failedRun.project_id,
+          task: playbookId,
+          input,
+          output: null,
+          provider: providerForFailedGeneration(error),
+          model: modelForFailedGeneration(error, playbookId, budgetMode),
+          budgetMode,
+          status: "failed",
+          error: error.message || "LLM generation failed.",
+          createdBy: actorId
+        });
+        failedRun.ai_run_id = accounting.aiRun.id;
+        addAudit(data, request, workspaceId, "playbook_run.failed", "playbook_run", failedRun.id, {
+          playbook_id: playbookId,
+          error_code: error.code || "INTERNAL_ERROR",
+          ai_run_id: accounting.aiRun.id
+        });
+        return {
+          ok: false,
+          status: statusForErrorCode(error.code),
+          error: {
+            code: error.code || "INTERNAL_ERROR",
+            message: error.message || "LLM generation failed.",
+            details: {
+              ...(error.details || {}),
+              playbook_run_id: failedRun.id,
+              ai_run_id: accounting.aiRun.id
+            }
+          },
+          run: failedRun,
+          aiRun: accounting.aiRun
+        };
+      }
       const output = generated.output;
       const effectiveInput = generated.input || input;
       const now = nowIso();
@@ -1668,7 +1916,7 @@ async function handleApi(store, request, response, url) {
         input: effectiveInput,
         output,
         status: "completed",
-        created_by: DEFAULT_USER_ID,
+        created_by: actorId,
         started_at: now,
         completed_at: now,
         created_at: now,
@@ -1683,13 +1931,23 @@ async function handleApi(store, request, response, url) {
         output,
         provider: generated.provider,
         model: generated.model,
-        budgetMode
+        budgetMode,
+        createdBy: actorId
       });
       run.ai_run_id = accounting.aiRun.id;
       addAudit(data, request, workspaceId, "playbook_run.complete", "playbook_run", run.id, { playbook_id: playbookId });
-      return run;
+      return { ok: true, run };
     });
-    sendJson(response, 201, { playbookRun: exposePlaybookRun(result), run: exposePlaybookRun(result) });
+    if (!result.ok) {
+      sendJson(response, result.status, {
+        error: result.error,
+        playbookRun: exposePlaybookRun(result.run),
+        run: exposePlaybookRun(result.run),
+        aiRun: result.aiRun
+      });
+      return;
+    }
+    sendJson(response, 201, { playbookRun: exposePlaybookRun(result.run), run: exposePlaybookRun(result.run) });
     return;
   }
 
@@ -1702,7 +1960,7 @@ async function handleApi(store, request, response, url) {
         throw error;
       }
       requireWorkspacePermission(data, request, run.workspace_id, "project.write");
-      const applied = applyPlaybookRunOutput(data, run, DEFAULT_USER_ID);
+      const applied = applyPlaybookRunOutput(data, run, currentUserId(request));
       addAudit(data, request, run.workspace_id, "playbook_run.approve_output", "playbook_run", run.id, {
         playbook_id: run.playbook_id,
         project_id: run.project_id
@@ -1720,6 +1978,7 @@ async function handleApi(store, request, response, url) {
   if (parts[0] === "playbook-runs" && parts[1] && method === "GET") {
     const run = store.snapshot.playbook_runs.find((item) => item.id === parts[1]);
     if (!run) return notFound(response);
+    requireWorkspaceRead(store.snapshot, request, run.workspace_id);
     sendJson(response, 200, { playbookRun: exposePlaybookRun(run), run: exposePlaybookRun(run) });
     return;
   }
@@ -1731,33 +1990,85 @@ async function handleApi(store, request, response, url) {
       const projectId = body.projectId || body.project_id || null;
       const task = body.task || "business_map_generation";
       const project = projectId ? projectFor(data, projectId) : null;
+      if (project && project.workspace_id !== workspaceId) {
+        const error = new Error("workspaceId must match the requested project workspace.");
+        error.code = "VALIDATION_ERROR";
+        error.details = { workspaceId, projectWorkspaceId: project.workspace_id };
+        throw error;
+      }
       requireWorkspacePermission(data, request, workspaceId, "ai.run");
-      const generated = await generatePlaybookOutput(data, {
-        workspaceId,
-        project,
-        task,
-        input: body.input || {},
-        budgetMode: body.budgetMode || body.budget_mode || "cheap",
-        approvedHighCost: Boolean(body.approvedHighCost || body.approved_high_cost)
-      });
-      return createAiAccounting(data, {
-        workspaceId,
-        projectId,
-        task,
-        input: generated.input || body.input || {},
-        output: generated.output,
-        provider: generated.provider,
-        model: generated.model,
-        budgetMode: body.budgetMode || body.budget_mode || "cheap"
-      }).aiRun;
+      const actorId = currentUserId(request);
+      const input = body.input || {};
+      const budgetMode = body.budgetMode || body.budget_mode || "cheap";
+      let generated;
+      try {
+        generated = await generatePlaybookOutput(data, {
+          workspaceId,
+          project,
+          task,
+          input,
+          budgetMode,
+          approvedHighCost: Boolean(body.approvedHighCost || body.approved_high_cost)
+        });
+      } catch (error) {
+        const accounting = createAiAccounting(data, {
+          workspaceId,
+          projectId,
+          task,
+          input,
+          output: null,
+          provider: providerForFailedGeneration(error),
+          model: modelForFailedGeneration(error, task, budgetMode),
+          budgetMode,
+          status: "failed",
+          error: error.message || "LLM generation failed.",
+          createdBy: actorId
+        });
+        addAudit(data, request, workspaceId, "ai_run.failed", "ai_run", accounting.aiRun.id, {
+          task,
+          error_code: error.code || "INTERNAL_ERROR"
+        });
+        return {
+          ok: false,
+          status: statusForErrorCode(error.code),
+          error: {
+            code: error.code || "INTERNAL_ERROR",
+            message: error.message || "LLM generation failed.",
+            details: {
+              ...(error.details || {}),
+              ai_run_id: accounting.aiRun.id
+            }
+          },
+          aiRun: accounting.aiRun
+        };
+      }
+      return {
+        ok: true,
+        aiRun: createAiAccounting(data, {
+          workspaceId,
+          projectId,
+          task,
+          input: generated.input || input,
+          output: generated.output,
+          provider: generated.provider,
+          model: generated.model,
+          budgetMode,
+          createdBy: actorId
+        }).aiRun
+      };
     });
-    sendJson(response, 201, { aiRun: result });
+    if (!result.ok) {
+      sendJson(response, result.status, { error: result.error, aiRun: result.aiRun });
+      return;
+    }
+    sendJson(response, 201, { aiRun: result.aiRun });
     return;
   }
 
   if (parts[0] === "ai-runs" && parts[1] && method === "GET") {
     const aiRun = store.snapshot.ai_runs.find((item) => item.id === parts[1]);
     if (!aiRun) return notFound(response);
+    requireWorkspaceRead(store.snapshot, request, aiRun.workspace_id);
     sendJson(response, 200, { aiRun });
     return;
   }
@@ -1797,7 +2108,7 @@ async function handleApi(store, request, response, url) {
         },
         preview: draft.preview,
         status: "draft",
-        requested_by: DEFAULT_USER_ID,
+        requested_by: currentUserId(request),
         approved_by: null,
         approved_at: null,
         executed_at: null,
@@ -1820,16 +2131,24 @@ async function handleApi(store, request, response, url) {
     const result = await store.transaction(async (data) => {
       const workspaceId = body.workspaceId || body.workspace_id || DEFAULT_WORKSPACE_ID;
       requireWorkspacePermission(data, request, workspaceId, "connector.write");
+      const projectId = body.projectId || body.project_id || null;
+      const project = projectId ? projectFor(data, projectId) : null;
+      if (project && project.workspace_id !== workspaceId) {
+        const error = new Error("workspaceId must match the requested project workspace.");
+        error.code = "VALIDATION_ERROR";
+        error.details = { workspaceId, projectWorkspaceId: project.workspace_id };
+        throw error;
+      }
       const toolAction = {
         id: createId(),
         workspace_id: workspaceId,
-        project_id: body.projectId || body.project_id || null,
+        project_id: projectId,
         tool_provider: body.toolProvider || body.tool_provider || "markdown",
         action_type: body.actionType || body.action_type || "draft",
         payload: body.payload || {},
         preview: body.preview || "",
         status: "draft",
-        requested_by: DEFAULT_USER_ID,
+        requested_by: currentUserId(request),
         approved_by: null,
         approved_at: null,
         executed_at: null,
@@ -1853,9 +2172,10 @@ async function handleApi(store, request, response, url) {
         throw error;
       }
       requireWorkspacePermission(data, request, action.workspace_id, "connector.write");
+      let execution = null;
       if (parts[2] === "approve") {
         action.status = "approved";
-        action.approved_by = DEFAULT_USER_ID;
+        action.approved_by = currentUserId(request);
         action.approved_at = nowIso();
       } else if (parts[2] === "cancel") {
         if (action.status === "completed") {
@@ -1872,11 +2192,21 @@ async function handleApi(store, request, response, url) {
           error.details = { status: action.status };
           throw error;
         }
-        action.status = "completed";
+        action.status = "executing";
+        execution = await executeToolAction(data, action);
+        action.status = execution.result.ok ? "completed" : "failed";
         action.executed_at = nowIso();
-        action.result = { ok: true, mode: "stub" };
+        action.result = execution.result;
+        if (execution.updatedProjectId) {
+          const project = projectFor(data, execution.updatedProjectId);
+          if (project) connectProjectMemoryGraph(data, project);
+        }
       }
-      addAudit(data, request, action.workspace_id, `tool_action.${parts[2]}`, "tool_action", action.id);
+      addAudit(data, request, action.workspace_id, `tool_action.${parts[2]}`, "tool_action", action.id, {
+        status: action.status,
+        mode: action.result?.mode || null,
+        updated_work_item_id: execution?.updatedWorkItemId || null
+      });
       return action;
     });
     sendJson(response, 200, { toolAction: result });
