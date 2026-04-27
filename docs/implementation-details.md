@@ -1,60 +1,46 @@
-# Open Business OS MVP 実装詳細
+# Open Business OS 実装詳細
 
-作成日: 2026-04-28
+更新日: 2026-04-28
 
-## 1. 位置づけ
+## 1. 現在の実装範囲
 
-このドキュメントは、現在のリポジトリに実装済みの軽量MVPの実装詳細をまとめる。
+このドキュメントは、現時点のリポジトリで実装済みのMVPを正とする。将来構想ではなく、いま起動・検証できる実装の詳細をまとめる。
 
-元の詳細設計書は将来のTypeScriptモノレポ、Drizzle、Queue、Provider/Connector Registryを想定している。一方、現在のMVPはまず最小ループをローカルで動かすため、Node.js標準機能中心で以下を実装している。PostgreSQL runtimeには `pg` を使う。
+実装済みの中核:
 
-- スマホ向けPWA UI
-- JSON API
-- JSONファイル永続化
-- 決定論的AIサンプル生成
-- 任意のDeepSeek互換ライブLLM経路
-- APIキー暗号化保存
-- コスト台帳
-- Playbook Run
-- Business Map / Initiative / WorkItem / Review
-- Markdown export
-- ToolAction draft / approval / execution
-- Repository境界
+- スマホ向けPWA
+- Node.js標準HTTPサーバによるJSON API
+- ローカルJSON Store
 - PostgreSQL runtime Store
-- Token based Auth / Workspace membership enforcement
-- Memory Graph / Project Memory Summary UI
-- GitHub Issue draft / dry-run / token実行
-- Browserless mobile E2E
-- Unit / Smoke test
+- Workspace / Project / Business Map / Initiative / WorkItem / Review
+- Playbook Runと承認後のProject State反映
+- Memory GraphとProject Memory Summary
+- 決定論的Sample LLM
+- DeepSeek互換Live LLM経路
+- Live LLM出力のJSON抽出、schema validation、repair prompt
+- APIキー暗号化保存、redaction、月次コスト推定
+- local / token auth、workspace membership enforcement
+- ToolAction draft / approve / execute
+- GitHub Issue dry-run / token実行
+- Markdown export
+- Unit / browserless mobile E2E / smoke / verify scripts
 
-## 2. 起動と確認
+## 2. 起動と検証
 
-### 起動
+標準起動:
 
 ```sh
+npm install
 npm run dev
 ```
 
-起動後:
+URL:
 
 ```txt
 http://localhost:3000
 ```
 
-### テスト
-
-```sh
-npm run check
-npm test
-npm run test:e2e
-npm run verify
-npm run dev
-BASE_URL=http://localhost:3000 npm run test:smoke
-```
-
-`npm run test:e2e` はPlaywrightを使わないbrowserless mobile E2Eである。PWA静的assetのmobile契約と、`handleApi` 直呼びによる主要workflow/API契約を検証する。実ブラウザでのviewport rendering、screenshot、overlap検出は後続のPlaywright suiteで扱う。
-
-PostgreSQL modeを使う場合:
+PostgreSQL mode:
 
 ```sh
 docker compose up -d
@@ -63,78 +49,110 @@ OPEN_BUSINESS_OS_STORE=postgres npm run dev
 
 `OPEN_BUSINESS_OS_INIT_DB=0` を指定しない限り、起動時に `packages/db/schema.sql` を適用する。
 
-### Live LLMを使う場合
-
-デフォルトは決定論的サンプル生成で動く。外部APIに依存せずテストを安定させるためである。
-
-DeepSeek互換APIを使う場合:
+Live LLM mode:
 
 ```sh
 OPEN_BUSINESS_OS_LIVE_LLM=1 DEEPSEEK_API_KEY=... npm run dev
 ```
 
-または、PWAの設定画面からworkspace APIキーを保存する。保存されたAPIキーはサーバー側で暗号化され、フロントエンドには返らない。
+標準検証:
+
+```sh
+npm run check
+npm test
+npm run test:e2e
+npm run verify
+```
+
+起動済みサーバーに対するsmoke:
+
+```sh
+BASE_URL=http://localhost:3000 npm run test:smoke
+```
+
+直近の確認状況:
+
+- `npm run verify`: pass
+- JavaScript syntax check: pass
+- `npm run test:smoke`: pass
+- PostgreSQL smoke: Docker daemon未起動のため未実行
 
 ## 3. 実装構成
 
+主要ファイル:
+
+- `apps/api/src/server.js`: API、静的PWA配信、Playbook Run、ToolAction、Markdown export
+- `apps/api/src/auth.js`: local / token auth、token抽出、membership解決
+- `apps/api/src/security.js`: APIサーバ側のsecret処理
+- `apps/api/src/store.js`: ローカルJSON Store
+- `apps/api/src/repositories/json.js`: JSON Store repository境界
+- `apps/api/src/repositories/postgres.js`: PostgreSQL Store runtime
+- `apps/api/src/connectors/github.js`: GitHub Issue実行
+- `apps/web/public/app.js`: dependency-free PWA
+- `apps/web/public/styles.css`: mobile-first UI
+- `packages/db/schema.sql`: PostgreSQL schema
+- `packages/llm-gateway/src/*`: provider routing、sample output、DeepSeek、cost、structured output repair
+- `packages/schemas/src/*`: structured output validation
+- `packages/security/src/*`: encryption、redaction、RBAC、audit helper
+- `tests/unit.mjs`: helperと認証境界
+- `tests/e2e-mobile.mjs`: browserless PWA/API workflow contract
+- `tests/smoke.mjs`: 起動済みAPIの主要workflow
+
+## 4. API
+
+API prefix:
+
 ```txt
-.
-├── apps/
-│   ├── api/
-│   │   └── src/
-│   │       ├── server.js
-│   │       ├── store.js
-│   │       ├── security.js
-│   │       └── repositories/
-│   └── web/
-│       └── public/
-│           ├── index.html
-│           ├── app.js
-│           ├── styles.css
-│           ├── manifest.webmanifest
-│           └── service-worker.js
-├── packages/
-│   ├── core/
-│   ├── db/
-│   ├── schemas/
-│   ├── llm-gateway/
-│   ├── playbooks/
-│   └── security/
-├── config/
-│   ├── provider-registry.json
-│   └── llm-policy.json
-├── tests/
-│   ├── unit.mjs
-│   ├── e2e-mobile.mjs
-│   └── smoke.mjs
-└── docs/
+/api/v1
 ```
 
-PostgreSQL移行のための初期schemaは `packages/db/schema.sql` に置く。現在のAPIはJSON Storeで動くが、DBのsource of truthはPostgreSQLへ移す前提で設計する。
+主要endpoint:
 
-## 4. APIサーバ
+```txt
+GET  /health
+GET  /me
 
-主ファイル:
+GET  /workspaces
+POST /workspaces
+GET  /workspaces/:workspaceId
+PATCH /workspaces/:workspaceId
 
-- `apps/api/src/server.js`
-- `apps/api/src/store.js`
-- `apps/api/src/security.js`
+GET  /projects
+POST /projects
+GET  /projects/:projectId
+GET  /projects/:projectId/business-map
+GET  /projects/:projectId/initiatives
+POST /projects/:projectId/initiatives
+GET  /projects/:projectId/work-items
+POST /projects/:projectId/work-items
+GET  /projects/:projectId/reviews
+POST /projects/:projectId/reviews
 
-### 4.1 HTTPサーバ
+GET  /projects/:projectId/memory/graph
+GET  /projects/:projectId/memory/nodes
+POST /projects/:projectId/memory/nodes
+POST /projects/:projectId/memory/edges
+GET  /projects/:projectId/memory/summary
+POST /projects/:projectId/memory/refresh-summary
 
-`server.js` はNode.js標準の `node:http` で動く。外部フレームワークは使っていない。
+GET  /playbooks
+POST /playbook-runs
+GET  /playbook-runs/:runId
+POST /playbook-runs/:runId/approve-output
+POST /ai-runs
+GET  /ai-runs/:aiRunId
 
-責務:
+POST /tool-actions
+POST /work-items/:workItemId/github-issue-draft
+GET  /projects/:projectId/tool-actions
+POST /tool-actions/:actionId/approve
+POST /tool-actions/:actionId/execute
+POST /tool-actions/:actionId/cancel
 
-- `/api/v1/*` のJSON API処理
-- `apps/web/public` の静的配信
-- SPA fallback
-- APIエラー形式の統一
-- Playbook Run実行
-- ToolAction承認ゲート
-- Markdown export
+GET  /projects/:projectId/export/markdown
+```
 
-APIエラー形式:
+エラー形式:
 
 ```json
 {
@@ -146,453 +164,76 @@ APIエラー形式:
 }
 ```
 
-主要エラーコードとHTTPステータスは `statusForErrorCode()` に集約している。
+## 5. 認証と権限
 
-### 4.2 永続化
+認証モードは `OPEN_BUSINESS_OS_AUTH_MODE` で切り替える。
 
-`store.js` の `JsonStore` が `data/open-business-os.json` に保存する。
+- `local`: default。組み込みLocal Userとして認証する。ローカル開発とtest用に `x-open-business-os-role` を許可する。
+- `token`: Bearer token、`x-open-business-os-token`、`x-api-token`、`obos_session` cookieからtokenを読む。
 
-特徴:
+token modeの設定例:
 
-- 初回起動時にLocal User / Local Workspaceを作成
-- `transaction()` で変更と保存を直列化
-- 失敗時は変更前snapshotへ戻す
-- 失敗したtransaction後も後続queueが詰まらない
-- `data/` は `.gitignore` 対象
-
-現在の主要collection:
-
-- `users`
-- `workspaces`
-- `workspace_memberships`
-- `projects`
-- `visions`
-- `metrics`
-- `assumptions`
-- `evidence`
-- `decisions`
-- `initiatives`
-- `work_items`
-- `reviews`
-- `playbook_runs`
-- `ai_runs`
-- `api_keys`
-- `budgets`
-- `cost_ledger`
-- `tool_actions`
-- `audit_logs`
-- `business_maps`
-
-### 4.3 主なAPI
-
-Health / Me:
-
-```txt
-GET /api/v1/health
-GET /api/v1/me
+```sh
+OPEN_BUSINESS_OS_AUTH_MODE=token OPEN_BUSINESS_OS_API_TOKEN=change-me npm run dev
 ```
 
-Workspace:
+複数tokenを使う場合:
 
 ```txt
-GET   /api/v1/workspaces
-POST  /api/v1/workspaces
-GET   /api/v1/workspaces/:workspaceId
-PATCH /api/v1/workspaces/:workspaceId
+OPEN_BUSINESS_OS_AUTH_TOKENS={"owner-token":{"userId":"usr_xxx"}}
 ```
 
-API Keys / Cost:
+権限はAPI側で強制する。UI表示だけには依存しない。
+
+- owner: API key、workspace設定、全write
+- admin: connector / ToolAction作成など
+- member: Project / WorkItem / Review / Playbook Run作成
+- viewer: readのみ
+- external_advisor: 制限付き閲覧
+
+`GET /api/v1/me` は認証済みuserとworkspace membershipを返す。token modeでは、workspace read/writeはmembership roleで判定する。
+
+## 6. 永続化
+
+defaultはJSON Store:
 
 ```txt
-GET  /api/v1/workspaces/:workspaceId/api-keys
-POST /api/v1/workspaces/:workspaceId/api-keys
-POST /api/v1/workspaces/:workspaceId/api-keys/test
-POST /api/v1/workspaces/:workspaceId/api-keys/:keyId/test
-GET  /api/v1/workspaces/:workspaceId/costs/summary
+data/open-business-os.json
 ```
 
-Project:
-
-```txt
-GET  /api/v1/projects
-POST /api/v1/projects
-GET  /api/v1/projects/:projectId
-GET  /api/v1/projects/:projectId/business-map
-GET  /api/v1/projects/:projectId/initiatives
-POST /api/v1/projects/:projectId/initiatives
-GET  /api/v1/projects/:projectId/work-items
-POST /api/v1/projects/:projectId/work-items
-GET  /api/v1/projects/:projectId/reviews
-POST /api/v1/projects/:projectId/reviews
-GET  /api/v1/projects/:projectId/memory/graph
-GET  /api/v1/projects/:projectId/memory/nodes
-POST /api/v1/projects/:projectId/memory/nodes
-POST /api/v1/projects/:projectId/memory/edges
-GET  /api/v1/projects/:projectId/memory/summary
-POST /api/v1/projects/:projectId/memory/refresh-summary
-GET  /api/v1/projects/:projectId/export/markdown
-```
-
-Playbook / AI:
-
-```txt
-GET  /api/v1/playbooks
-POST /api/v1/playbook-runs
-GET  /api/v1/playbook-runs/:runId
-POST /api/v1/playbook-runs/:runId/approve-output
-POST /api/v1/ai-runs
-GET  /api/v1/ai-runs/:aiRunId
-```
-
-ToolAction:
-
-```txt
-POST /api/v1/tool-actions
-POST /api/v1/work-items/:workItemId/github-issue-draft
-GET  /api/v1/projects/:projectId/tool-actions
-POST /api/v1/tool-actions/:actionId/approve
-POST /api/v1/tool-actions/:actionId/execute
-POST /api/v1/tool-actions/:actionId/cancel
-```
-
-`execute` は `approved` 状態でない場合、`TOOL_ACTION_REQUIRES_APPROVAL` を返す。
-
-## 5. Web/PWA
-
-主ファイル:
-
-- `apps/web/public/index.html`
-- `apps/web/public/app.js`
-- `apps/web/public/styles.css`
-- `apps/web/public/manifest.webmanifest`
-- `apps/web/public/service-worker.js`
-
-### 5.1 UI構成
-
-`app.js` は依存なしのSPAで、以下のviewを持つ。
-
-- `idea`: 事業アイデア一文入力
-- `intake`: 段階質問
-- `map`: Business Mapカード
-- `work`: Initiative / WorkItem
-- `review`: Review入力
-- `memory`: Playbook output承認、Memory Graph、Project Memory Summary
-- `export`: Markdown export
-- `settings`: Workspace / AI / 予算
-
-下部ナビから主要viewへ移動できる。スマホの片手操作を優先し、主要操作はカード単位にしている。
-
-### 5.2 状態管理
-
-フロントエンド状態は `localStorage` の `open-business-os-mvp` に保存する。
-
-ただし、APIキーやsecret相当の値は保存対象から除外する。
-
-- `apiKey`
-- `api_key`
-- `secret`
-- `token`
-
-APIが使えない場合は `sampleMode` に切り替わり、ローカルサンプル生成で操作を継続する。
-
-### 5.3 API接続
-
-`apiRequest()` が `/api/v1` へfetchする。失敗時は `syncWithFallback()` がfallback関数を呼び、UIを止めない。
-
-APIレスポンスは `unwrapApi()` で以下を吸収する。
-
-- `workspace`
-- `project`
-- `businessMap`
-- `business_map`
-- `playbookRun.output`
-- `run.output`
-- `output`
-- `result`
-
-Memory viewでは以下を扱う。
-
-- `POST /playbook-runs/:id/approve-output`
-- `GET /projects/:id/memory/graph`
-- `GET /projects/:id/memory/summary`
-- WorkItem単位の簡易Trace
-- WorkItemからGitHub Issue draft作成
-
-Cost dockでは月次使用額、残額、予算超過状態を表示する。APIからCost Summaryが取得できない場合はローカル推定で継続する。
-
-## 6. Core
-
-主ファイル:
-
-- `packages/core/src/entities.js`
-- `packages/core/src/index.js`
-
-責務:
-
-- Workspace / Project生成
-- Card生成と承認/アーカイブ
-- Assumption状態更新
-- Initiative生成
-- WorkItem生成
-- Review生成
-- ToolAction状態更新
-
-現時点ではAPIサーバ側にもsnake_caseでの生成処理がある。次フェーズでは、API実装を `packages/core` のhelperへ寄せて重複を減らす。
-
-## 7. Schema
-
-主ファイル:
-
-- `packages/schemas/src/validation.js`
-- `packages/schemas/src/business-map.js`
-- `packages/schemas/src/initiative-generation.js`
-- `packages/schemas/src/engineering-state-analysis.js`
-- `packages/schemas/src/api-error.js`
-- `packages/schemas/src/index.js`
-
-Zodなどの外部依存は使わず、手書きvalidatorで以下を検証する。
-
-- `BusinessMapOutput`
-- `InitiativeGenerationOutput`
-- `EngineeringStateAnalysisOutput`
-- API Error shape
-
-テストでは、enum不正値やtimebox範囲外が拒否されることを確認している。
-
-## 8. LLM Gateway
-
-主ファイル:
-
-- `packages/llm-gateway/src/provider-registry.js`
-- `packages/llm-gateway/src/policy-routing.js`
-- `packages/llm-gateway/src/cost-estimator.js`
-- `packages/llm-gateway/src/sample-output.js`
-- `packages/llm-gateway/src/deepseek.js`
-- `packages/llm-gateway/src/index.js`
-- `config/provider-registry.json`
-- `config/llm-policy.json`
-
-### 8.1 Routing
-
-`provider-registry.json` にProviderとModelを定義する。
-
-現在のProvider:
-
-- `deepseek_direct`
-- `openrouter`
-- `litellm_proxy`
-
-`llm-policy.json` にtask別routing、approval条件、max output tokens、fallback方針を定義する。
-
-### 8.2 Sample Output
-
-`sample-output.js` と `samples.js` が決定論的なサンプル出力を返す。
-
-サンプル生成は以下の理由でデフォルトになっている。
-
-- 外部ネットワークなしで動く
-- テストが安定する
-- BYOK設定前でもUIを試せる
-- コストが発生しない
-
-### 8.3 DeepSeek互換経路
-
-`deepseek.js` はOpenAI互換のchat requestを組み立てる。
-
-`server.js` の `generatePlaybookOutput()` は、以下の条件でライブLLMを呼ぶ。
-
-- `OPEN_BUSINESS_OS_LIVE_LLM=1`
-- workspace APIキーまたは `DEEPSEEK_API_KEY` が存在する
-
-条件を満たさない場合はサンプル生成に戻る。
-
-### 8.4 Cost
-
-`cost-estimator.js` と `cost.js` がtoken数とモデル価格から推定コストを計算する。
-
-API実行時には `ai_runs` と `cost_ledger` に以下を保存する。
-
-- provider
-- model
-- task
-- input tokens
-- output tokens
-- cache hit tokens
-- estimated cost USD
-- status
-
-## 9. Security
-
-主ファイル:
-
-- `packages/security/src/secrets.js`
-- `packages/security/src/redaction.js`
-- `packages/security/src/rbac.js`
-- `packages/security/src/audit.js`
-- `apps/api/src/security.js`
-
-### 9.1 APIキー暗号化
-
-APIキーはAES-256-GCMで暗号化する。
-
-暗号鍵の材料:
-
-1. `OPEN_BUSINESS_OS_ENCRYPTION_KEY`
-2. `OPEN_BUSINESS_OS_SECRET`
-3. local dev fallback
-
-保存時:
-
-- `encrypted_key` に暗号文
-- `key_hint` に識別用の短いhint
-- raw keyはレスポンスに含めない
-
-### 9.2 Redaction
-
-`redaction.js` は以下をマスクする。
-
-- `apiKey`
-- `token`
-- `secret`
-- `password`
-- `Bearer ...`
-- `sk-...`
-
-### 9.3 Auth / RBAC
-
-`rbac.js` はrole rankとaction別最小roleを持つ。
-
-現在のrole:
-
-- `owner`
-- `admin`
-- `member`
-- `viewer`
-- `external_advisor`
-
-APIは `OPEN_BUSINESS_OS_AUTH_MODE` で認証モードを切り替える。
-
-- `local`（default）: 組み込みLocal Userとして認証する。既存のローカル開発とtestを壊さないため、`x-open-business-os-role` headerでroleを切り替えられる。
-- `token`: `Authorization: Bearer ...`、`x-open-business-os-token`、`x-api-token`、または `obos_session` cookieからtoken/sessionを抽出する。`OPEN_BUSINESS_OS_API_TOKEN` はdefault user用の単一token、`OPEN_BUSINESS_OS_AUTH_TOKENS` はtokenから既存user idへのmappingを持つ。
-
-`GET /api/v1/me` は認証されたuserとworkspace membershipを返す。`token` modeでは未認証requestはwrite endpointを実行できず、workspace read/writeはmembership roleで判定する。
-
-現在APIで確認している例:
-
-- OwnerのみAPIキー作成
-- Member以上のみProject / WorkItem / Review / AI run作成
-- Admin以上のみConnector / ToolAction作成
-
-ローカル検証以外では `x-open-business-os-role` headerは権限判定に使わない。
-
-### 9.4 ToolAction安全性
-
-ToolActionは外部書き込みの下書きモデルである。
-
-現在の実装:
-
-1. `POST /tool-actions` で `draft`
-2. `POST /work-items/:id/github-issue-draft` でGitHub Issue作成draft
-3. `POST /tool-actions/:id/approve` で `approved`
-4. `POST /tool-actions/:id/execute` で `completed`
-
-`approved` 前のexecuteは拒否する。実際のGitHub API呼び出しはまだ実装していない。
-
-## 10. Playbook
-
-定義ファイル:
-
-- `packages/playbooks/registry/idea_intake.json`
-- `packages/playbooks/registry/business_map_generation.json`
-- `packages/playbooks/registry/initiative_generation.json`
-- `packages/playbooks/registry/implementation_breakdown.json`
-- `packages/playbooks/registry/weekly_review.json`
-
-APIでは `POST /api/v1/playbook-runs` がplaybookIdを受け取り、対応するtaskの出力を作る。
-
-現在は同期実行で即 `completed` になる。将来はQueue/BullMQ/Temporalで非同期化する。
-
-## 11. Markdown Export
-
-`GET /api/v1/projects/:projectId/export/markdown` はtext/markdownを返す。
-
-含めるセクション:
-
-- Project title
-- Business Map
-- Target Users
-- Assumptions
-- Risks
-- Initiative / 施策
-- WorkItem / タスク
-- Review / レビュー
-- Decision Log
-- Memory Graph
-
-APIキーなどのsecretは含めない。
-
-## 12. Test
-
-### Unit
-
-`tests/unit.mjs`
-
-検証内容:
-
-- APIキー暗号化/復号
-- 暗号化payloadにplaintextが含まれない
-- redaction
-- BusinessMap schema
-- Initiative schema
-- LLM cost estimator
-- RBAC
-- JSON Repository境界
-
-### Smoke
-
-`tests/smoke.mjs`
-
-起動済みAPIに対して、MVPの主要ループを直列に検証する。
-
-検証内容:
-
-- health endpoint
-- PWA index配信
-- manifest配信
-- workspace作成
-- APIキー保存とsecret非返却
-- viewer roleのAPIキー作成拒否
-- project作成
-- playbook run
-- high_qualityの明示承認要求
-- Playbook output承認適用
-- Memory Graph / Summary
-- business map取得
-- initiative作成
-- work item作成
-- WorkItemからGitHub Issue draft作成
-- review作成
-- ToolAction draft/approve/execute
-- Markdown export
-- Cost summary
-
-## 13. 既知の制約
-
-- OIDC / secure cookie sessionは未実装
-- PostgreSQL runtimeは実装済み。Docker daemonが動いていない環境ではPostgres smokeは実行できない
-- Queueは未実装
-- Budget enforcementはPlaybook live LLM実行前に適用。Provider実使用量との精算は未実装
-- AI出力のrepair promptはDeepSeek live経路に実装済み。evalによる品質保証は未実装
-- Provider fallbackの実呼び出しは未実装
-- GitHub Issue実行はtoken設定時に対応。Slack/Webhook connectorは未実装
-- フロントのカード編集は主にローカル状態中心
-- 本番運用向けのrate limit / CSRF / secure cookie / OIDCは未実装
-
-## 14. DB / Memory方針
-
-DBの本命はPostgreSQLにする。現在のJSON Storeはローカル開発用fallbackとして残す。
-
-採用方針:
+PostgreSQL modeは `OPEN_BUSINESS_OS_STORE=postgres` と `DATABASE_URL` を使う。`pg` を直接使い、schemaは `packages/db/schema.sql` をsourceにする。
+
+主要collection / table:
+
+- users
+- workspaces
+- workspace_memberships
+- projects
+- visions
+- metrics
+- assumptions
+- evidence
+- decisions
+- initiatives
+- work_items
+- reviews
+- playbook_runs
+- ai_runs
+- api_keys
+- budgets
+- cost_ledger
+- tool_actions
+- audit_logs
+- business_maps
+- memory_nodes
+- memory_edges
+- project_memory_summaries
+
+JSON Storeはローカル開発とゼロ設定起動用に残す。実運用のsource of truthはPostgreSQLへ寄せる。
+
+## 7. Memory Graph
+
+長期記憶の方針:
 
 ```txt
 Rules: Markdown
@@ -603,51 +244,167 @@ LLM Context: graph traversal + summary
 Export: Markdown
 ```
 
-固定ルールや設計原則はMarkdownで管理する。一方、仮説、証拠、意思決定、却下理由、置換関係、WorkItemの理由はDBのMemory Graphで管理する。
+Markdownは固定ルール、設計原則、共有、レビュー、export用に使う。変化する状態、却下理由、置換関係、意思決定、根拠はDBのMemory Graphで管理する。
 
-追加済みのDB設計:
+代表的なnode type:
 
-- `packages/db/schema.sql`
-- `memory_nodes`
-- `memory_edges`
-- `project_memory_summaries`
-- `docker-compose.yml`
-- `.env.example`
+- vision
+- metric
+- assumption
+- evidence
+- decision
+- initiative
+- work_item
+- review
+- risk
+- constraint
+- preference
+- lesson
+- tool_action
+- ai_run
 
-Memory Graphの詳細は `docs/memory-architecture.md` を参照。
+代表的なrelation type:
 
-現在のJSON Store実装にも、PostgreSQL schemaと同じ考え方で以下を追加済み。
+- supports
+- supported_by
+- contradicts
+- caused_by
+- derived_from
+- replaced_by
+- blocks
+- implements
+- implemented_by
+- validated_by
+- rejected_because
+- depends_on
+- measured_by
+- similar_to
+- mentions
+- updates
 
-- `memory_nodes`
-- `memory_edges`
-- `project_memory_summaries`
+重要なクエリ例:
 
-APIサーバには `apps/api/src/repositories/` を追加し、JSON StoreとPostgreSQL Storeを同じ `transaction()` / `snapshot` 契約で扱う。`OPEN_BUSINESS_OS_STORE=postgres` と `DATABASE_URL` がある場合はPostgreSQLをsource of truthとして使う。
+- 「このWorkItemはなぜ必要か」: WorkItem -> Initiative -> Assumption -> Metricを辿る。
+- 「3週間前に否決した案は何か」: rejected / superseded nodeと `rejected_because` / `replaced_by` edgeを辿る。
+- 「前回同じ問題をどう解いたか」: lesson / review / decision / work_itemと `similar_to` 候補を辿る。
 
-Business Map生成結果は `metrics` と `assumptions` に正規化される。Initiative生成結果は関連するAssumption / Metricを推定して `related_assumption_id` / `related_metric_id` を持つ。WorkItemは `initiative_id` を持ち、Memory Graph上では `implements` edgeで接続される。
+pgvectorは将来の補助検索に使う。因果関係や却下理由のsource of truthにはしない。
 
-Playbook Runのoutputは `POST /api/v1/playbook-runs/:runId/approve-output` でProject Stateへ適用できる。Business Map outputは承認後に `business_maps.status = approved` となり、Project StateとMemory Graphへ反映される。
+## 8. LLM Gateway
 
-Live LLM経路では、taskに応じて以下のschema validationを保存前に実行する。
+defaultはSample LLM。外部APIなしで動き、テストが安定する。
 
-- `business_map_generation`: `BusinessMapOutput`
-- `initiative_generation`: `InitiativeGenerationOutput`
-- `implementation_breakdown`: `InitiativeGenerationOutput`
-- `engineering_state_analysis`: `EngineeringStateAnalysisOutput`
+Live LLM実行条件:
 
-`budgetMode = high_quality` は明示承認なしでは `TOOL_ACTION_REQUIRES_APPROVAL` で拒否する。Live LLM実行時は推定コストを月次予算と照合し、超過時は `BUDGET_EXCEEDED` を返す。
+- `OPEN_BUSINESS_OS_LIVE_LLM=1`
+- workspace API key、または `DEEPSEEK_API_KEY` がある
 
-Live LLMのJSON parseまたはschema validationに失敗した場合は、元の出力をProject Stateへ保存せず、1回だけrepair promptを実行する。repair後も失敗した場合は `playbook_runs.output = null` のfailed runとfailed `ai_runs` を記録し、`SCHEMA_VALIDATION_FAILED` のreviewable errorを返す。
+Live LLM経路では、task別にschema validationを行う。
 
-GitHub Issue ToolActionは `approved` 状態だけがexecute可能。`OPEN_BUSINESS_OS_GITHUB_TOKEN` がない場合はdry-run resultで完了し、tokenとrepository設定がある場合はGitHub Issues APIへ作成する。実作成に成功した場合はsource WorkItemの `external_provider` / `external_id` / `external_url` を更新する。
+- `business_map_generation`: BusinessMapOutput
+- `initiative_generation`: InitiativeGenerationOutput
+- `implementation_breakdown`: InitiativeGenerationOutput
+- `engineering_state_analysis`: EngineeringStateAnalysisOutput
 
-## 15. 次に触るべき場所
+JSON parseまたはschema validationに失敗した場合、元の出力をProject Stateへ保存しない。1回だけrepair promptを実行し、repair後も失敗した場合はfailed `playbook_run` / `ai_run` とreviewable errorを残す。
 
-優先度が高い順:
+`budgetMode = high_quality` は明示承認なしでは拒否する。Live LLM実行前には月次予算と推定コストを照合する。
 
-1. OIDC / secure cookie sessionを導入する
-2. Playwright化し、スマホviewportでMemory/承認UIを検証する
-3. Redis/BullMQ等でPlaybook Runをdurable async queueへ移す
-4. Provider fallbackを実装する
-5. API生成処理を `packages/core` helperへ寄せる
-6. Slack/Webhook connectorを追加する
+## 9. ToolAction / GitHub
+
+外部ツールへの書き込みは必ずToolActionを経由する。
+
+状態遷移:
+
+```txt
+draft -> approved -> completed
+draft -> cancelled
+approved -> failed
+```
+
+GitHub Issue flow:
+
+1. WorkItemからGitHub Issue draftを作成する。
+2. ユーザーがToolActionをapproveする。
+3. `execute` で実行する。
+4. token未設定ならdry-run resultで完了する。
+5. tokenとrepository設定があればGitHub Issues APIへ作成する。
+6. 成功時はWorkItemに `external_provider` / `external_id` / `external_url` を保存する。
+
+設定例:
+
+```sh
+OPEN_BUSINESS_OS_GITHUB_TOKEN=github_pat_here \
+OPEN_BUSINESS_OS_GITHUB_REPOSITORY=owner/repo \
+npm run dev
+```
+
+`OPEN_BUSINESS_OS_GITHUB_OWNER` と `OPEN_BUSINESS_OS_GITHUB_REPO` でも設定できる。
+
+## 10. PWA
+
+PWAは `apps/web/public` にあるdependency-free SPA。
+
+主なview:
+
+- idea
+- intake
+- map
+- work
+- review
+- memory
+- export
+- settings
+
+UI状態は `localStorage` の `open-business-os-mvp` に保存する。ただし、secret相当の値は永続化しない。
+
+除外対象:
+
+- apiKey
+- api_key
+- secret
+- token
+
+browserless E2Eでは、manifest、service worker、320px最小幅、44px tap target、safe-area、主要workflow API contractを確認する。実ブラウザviewport、screenshot、overlap検出はPlaywright導入後に追加する。
+
+## 11. Markdown Export
+
+`GET /api/v1/projects/:projectId/export/markdown` は共有用Markdownを返す。
+
+含める内容:
+
+- Project title
+- Business Map
+- Target Users
+- Assumptions
+- Risks
+- Initiatives
+- WorkItems
+- Reviews
+- Decision Log
+- Memory Graph
+
+API key、encrypted key、token、secretは含めない。
+
+## 12. 既知の制約
+
+- OIDC / secure cookie session / CSRFは未実装。
+- Durable Queueは未実装。Playbook Runは現在同期実行。
+- PostgreSQL runtimeは実装済みだが、Docker daemonがない環境ではPostgres smokeを実行できない。
+- JSON -> PostgreSQL migration、backup、restore、schema drift checkは未実装。
+- Provider fallbackの実呼び出しは未実装。
+- pgvector補助検索は未実装。
+- Playwrightによる実viewport visual regressionは未実装。
+- Slack / Webhook connectorは未実装。
+- AI eval scenarioは未実装。
+
+## 13. 次に触る場所
+
+優先順:
+
+1. `apps/api/src/auth.js`: OIDC / secure cookie / CSRF
+2. `apps/api/src/server.js`: async Playbook Run、worker分離、polling API
+3. `apps/api/src/repositories/postgres.js`: migration、backup/restore検証
+4. `tests/e2e-mobile.mjs` と新規Playwright suite: 実スマホviewport検証
+5. `packages/llm-gateway/src/*`: provider fallback
+6. `packages/db/schema.sql`: pgvector補助検索

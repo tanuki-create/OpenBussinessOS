@@ -220,14 +220,12 @@ Long-term project memory is represented as:
 - `memory_edges`
 - `project_memory_summaries`
 
-See [packages/db/schema.sql](packages/db/schema.sql) and [docs/memory-architecture.md](docs/memory-architecture.md) for the database and memory design.
+See [packages/db/schema.sql](packages/db/schema.sql) and [docs/implementation-details.md](docs/implementation-details.md) for the database and memory design.
 
 ## Documentation
 
 - [Detailed design](open_business_os_detailed_design.md)
-- [MVP implementation notes](docs/mvp-implementation.md)
 - [Implementation details](docs/implementation-details.md)
-- [Memory architecture](docs/memory-architecture.md)
 - [Next actions](docs/next-actions.md)
 
 ## Project Status
